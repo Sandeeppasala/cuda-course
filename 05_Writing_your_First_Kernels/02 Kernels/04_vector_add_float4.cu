@@ -4,7 +4,7 @@
 #include <cuda_runtime.h>
 
 #define N 10000000  // Vector size = 10 million
-#define BLOCK_SIZE 256
+#define BLOCK_SIZE 512
 
 // Example:
 // A = [1, 2, 3, 4, 5]
@@ -18,15 +18,14 @@ void vector_add_cpu(float *a, float *b, float *c, int n) {
     }
 }
 
-__global__ void vector_add_gpu(const float* A,
-                           const float* B,
-                           float* C,
-                           int n)
+__global__ __launch_bounds__(BLOCK_SIZE)
+void vector_add_gpu(const float* __restrict__ A,
+                   const float* __restrict__ B,
+                   float* __restrict__ C,
+                   int n)
 {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-
-    int N4 = n / 4;
 
     // Process pairs
     for (int idx = tid; idx < n / 4; idx += stride) {
@@ -34,19 +33,21 @@ __global__ void vector_add_gpu(const float* A,
         float4 y = reinterpret_cast<const float4*>(B)[idx];
 
         float4 z;
-        z.x = x.x + y.x;
-        z.y = x.y + y.y;
-        z.z = x.z + y.z;
-        z.w = x.w + y.w; 
+        z.x = __fadd_rn(x.x, y.x);
+        z.y = __fadd_rn(x.y, y.y);
+        z.z = __fadd_rn(x.z, y.z);
+        z.w = __fadd_rn(x.w, y.w);
+
         reinterpret_cast<float4*>(C)[idx] = z;
     }
-    
-    if (tid == 0) {
-        for (int i = N4 * 4; i < n; i++) {
-            C[i] = A[i] + B[i];
+
+    // Handle tail elements (single thread only)
+    int tail = n & 3;
+    if (tail && tid == 0) {
+        for (int i = n - tail; i < n; ++i) {
+            C[i] = __fadd_rn(A[i], B[i]);
         }
     }
-
 }
 
 // Initialize vector with random values
@@ -67,12 +68,14 @@ int main() {
     float *h_a, *h_b, *h_c_cpu, *h_c_gpu;
     float *d_a, *d_b, *d_c;
     size_t size = N * sizeof(float);
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
 
-    // Allocate host memory
-    h_a = (float*)malloc(size);
-    h_b = (float*)malloc(size);
-    h_c_cpu = (float*)malloc(size);
-    h_c_gpu = (float*)malloc(size);
+    // Allocate pinned host memory
+    cudaHostAlloc((void**)&h_a, size, cudaHostAllocDefault);
+    cudaHostAlloc((void**)&h_b, size, cudaHostAllocDefault);
+    cudaHostAlloc((void**)&h_c_cpu, size, cudaHostAllocDefault);
+    cudaHostAlloc((void**)&h_c_gpu, size, cudaHostAllocDefault);
 
     // Initialize vectors
     srand(time(NULL));
@@ -84,14 +87,21 @@ int main() {
     cudaMalloc(&d_b, size);
     cudaMalloc(&d_c, size);
 
-    // Copy data to device
-    cudaMemcpy(d_a, h_a, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_b, h_b, size, cudaMemcpyHostToDevice);
+    // Copy data to device (async)
+    cudaMemcpyAsync(d_a, h_a, size, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_b, h_b, size, cudaMemcpyHostToDevice, stream);
+    cudaStreamSynchronize(stream); // Ensure data is on device before kernel
 
+#if 0
     // Define grid and block dimensions
     int num_blocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
     // N = 1024, BLOCK_SIZE = 256, num_blocks = 4
     // (N + BLOCK_SIZE - 1) / BLOCK_SIZE = ( (1025 + 256 - 1) / 256 ) = 1280 / 256 = 4 rounded 
+#else
+    int numSMs;
+    cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0);
+    int num_blocks = numSMs * 16;   // or *16 or *32
+#endif
 
     // Warm-up runs
     printf("Performing warm-up runs...\n");
@@ -115,13 +125,21 @@ int main() {
     // Benchmark GPU implementation
     printf("Benchmarking GPU implementation...\n");
     double gpu_total_time = 0.0;
+    cudaEvent_t s, e;
+    cudaEventCreate(&s);
+    cudaEventCreate(&e);
     for (int i = 0; i < 20; i++) {
-        double start_time = get_time();
-        vector_add_gpu<<<num_blocks, BLOCK_SIZE>>>(d_a, d_b, d_c, N);
-        cudaDeviceSynchronize();
-        double end_time = get_time();
-        gpu_total_time += end_time - start_time;
+        cudaEventRecord(s, stream);
+        vector_add_gpu<<<num_blocks, BLOCK_SIZE, 0, stream>>>(d_a, d_b, d_c, N);
+        cudaEventRecord(e, stream);
+        cudaEventSynchronize(e);
+        float ms;
+        cudaEventElapsedTime(&ms, s, e);
+        printf("Kernel time: %f ms\n", ms);
+        gpu_total_time += ms / 1000.0;
     }
+    cudaEventDestroy(s);
+    cudaEventDestroy(e);
     double gpu_avg_time = gpu_total_time / 20.0;
 
     // Print results
@@ -130,7 +148,8 @@ int main() {
     printf("Speedup: %fx\n", cpu_avg_time / gpu_avg_time);
 
     // Verify results (optional)
-    cudaMemcpy(h_c_gpu, d_c, size, cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(h_c_gpu, d_c, size, cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
     bool correct = true;
     for (int i = 0; i < N; i++) {
         if (fabs(h_c_cpu[i] - h_c_gpu[i]) > 1e-5) {
@@ -141,13 +160,13 @@ int main() {
     printf("Results are %s\n", correct ? "correct" : "incorrect");
 
     // Free memory
-    free(h_a);
-    free(h_b);
-    free(h_c_cpu);
-    free(h_c_gpu);
+    cudaFreeHost(h_a);
+    cudaFreeHost(h_b);
+    cudaFreeHost(h_c_cpu);
+    cudaFreeHost(h_c_gpu);
     cudaFree(d_a);
     cudaFree(d_b);
     cudaFree(d_c);
-
+    cudaStreamDestroy(stream);
     return 0;
 }
